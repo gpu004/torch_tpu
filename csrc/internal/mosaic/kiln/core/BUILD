@@ -29,6 +29,7 @@ torch_tpu_cc_library(
     deps = [
         ":dtype",
         ":literal",
+        ":shape",
         ":value_base",
         "@com_google_absl//absl/log:absl_check",
         "@llvm-project//llvm:Support",
@@ -50,22 +51,19 @@ torch_tpu_cc_library(
 )
 
 torch_tpu_cc_library(
-    name = "literal",
-    hdrs = ["literal.h"],
+    name = "shape",
+    hdrs = ["shape.h"],
+    deps = [
+        ":dtype",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
+    ],
 )
 
 torch_tpu_cc_library(
-    name = "cond",
-    srcs = ["cond.cc"],
-    hdrs = ["cond.h"],
-    deps = [
-        ":context",
-        ":dtype",
-        ":value_base",
-        "@com_google_absl//absl/log:absl_check",
-        "@llvm-project//mlir:ArithDialect",
-        "@llvm-project//mlir:IR",
-    ],
+    name = "literal",
+    hdrs = ["literal.h"],
 )
 
 torch_tpu_cc_library(
@@ -85,6 +83,7 @@ torch_tpu_cc_library(
         ":context",
         ":dtype",
         ":elementwise",
+        ":shape",
         "@com_google_absl//absl/log:absl_check",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:ArithDialect",
@@ -99,7 +98,6 @@ torch_tpu_cc_library(
     srcs = ["scalar.cc"],
     hdrs = ["scalar.h"],
     deps = [
-        ":cond",
         ":context",
         ":dtype",
         ":elementwise",
@@ -131,6 +129,7 @@ torch_tpu_cc_library(
         ":context",
         ":index_arg",
         ":scalar",
+        ":shape",
         "@com_google_absl//absl/log:absl_check",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:ArithDialect",
@@ -143,7 +142,6 @@ torch_tpu_cc_library(
     srcs = ["control_flow.cc"],
     hdrs = ["control_flow.h"],
     deps = [
-        ":cond",
         ":context",
         ":dtype",
         ":index_arg",
@@ -169,7 +167,9 @@ torch_tpu_cc_library(
         ":elementwise_impl",
         ":index_arg",
         ":literal",
+        ":mlir_utils",
         ":scalar",
+        ":shape",
         ":value_base",
         "//csrc/internal/mosaic:op_builders",
         "@com_google_absl//absl/log:absl_check",
@@ -191,6 +191,7 @@ torch_tpu_cc_library(
         ":index_arg",
         ":mlir_utils",
         ":scalar",
+        ":shape",
         ":specs",
         ":tile",
         ":value_base",
@@ -232,6 +233,7 @@ torch_tpu_cc_library(
         ":dtype",
         ":ref",
         ":semaphore",
+        ":shape",
         ":specs",
         "//csrc/internal/mosaic:op_builders",
         "@com_google_absl//absl/log:absl_check",
@@ -255,8 +257,8 @@ torch_tpu_cc_library(
     name = "specs",
     hdrs = ["specs.h"],
     deps = [
-        ":dtype",
         ":index_map",
+        ":shape",
         "@llvm-project//llvm:Support",
     ],
 )
@@ -272,6 +274,7 @@ torch_tpu_cc_library(
         ":index_map",
         ":ref",
         ":scalar",
+        ":shape",
         ":specs",
         "//csrc/common:error_utils",
         "//csrc/internal/mosaic:op_builders",

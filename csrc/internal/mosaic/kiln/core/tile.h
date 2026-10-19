@@ -25,6 +25,7 @@
 #include "csrc/internal/mosaic/kiln/core/index_arg.h"
 #include "csrc/internal/mosaic/kiln/core/literal.h"
 #include "csrc/internal/mosaic/kiln/core/scalar.h"
+#include "csrc/internal/mosaic/kiln/core/shape.h"
 #include "csrc/internal/mosaic/kiln/core/value_base.h"
 #include "llvm/ADT/ArrayRef.h"
 
@@ -39,15 +40,16 @@ namespace torch_tpu::kiln {
 // side which is splatted in the tile's dtype. Element types are never promoted
 // implicitly; use `AsType`.
 class Tile : public ValueBase,
-             public WithElementwiseOps<Tile, Tile>,
-             public WithLiteralOps<Tile, Tile> {
+             public WithElementwiseOps<Tile>,
+             public WithLiteralOps<Tile> {
  public:
   // Construct a 0-D tile from a scalar.
   /* implicit */ Tile(Scalar scalar);  // NOLINT(google-explicit-constructor)
 
   Tile MakeConstant(Literal value) const { return Full(value); }
 
-  llvm::ArrayRef<int64_t> shape() const;
+  llvm::ArrayRef<int64_t> dims() const;
+  Shape shape() const { return Shape(dims(), dtype()); }
   int64_t rank() const;
   int64_t num_elements() const;
 
@@ -84,10 +86,10 @@ class Tile : public ValueBase,
 };
 
 // Tile constructors.
-Tile Zeros(llvm::ArrayRef<int64_t> shape, DType dtype);
-Tile Full(llvm::ArrayRef<int64_t> shape, DType dtype, Literal value);
-Tile NInf(llvm::ArrayRef<int64_t> shape, DType dtype);
-Tile Iota(llvm::ArrayRef<int64_t> shape, DType dtype, int axis);
+Tile Zeros(const Shape& shape);
+Tile Full(const Shape& shape, Literal value);
+Tile NInf(const Shape& shape);
+Tile Iota(const Shape& shape, int axis);
 Tile Splat(Scalar scalar, llvm::ArrayRef<int64_t> shape);
 
 inline Tile Rotate(Tile t, IndexArg amount, int32_t axis) {
