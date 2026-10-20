@@ -19,7 +19,6 @@
 #include <cstdint>
 
 #include "absl/log/absl_check.h"
-#include "csrc/internal/mosaic/kiln/core/cond.h"
 #include "csrc/internal/mosaic/kiln/core/context.h"
 #include "csrc/internal/mosaic/kiln/core/dtype.h"
 #include "csrc/internal/mosaic/kiln/core/elementwise.h"
@@ -54,14 +53,6 @@ Scalar::Scalar(const void* impl, DType dtype) : ValueBase(impl, dtype) {
       << "Scalar must be an integer or floating-point value";
 }
 
-Scalar::Scalar(Cond cond)
-    : Scalar(internal::unwrap(cond).getAsOpaquePointer(), BoolType()) {}
-
-Scalar::operator Cond() const {
-  ABSL_CHECK(dtype().IsBool()) << "Cond requires a bool scalar";  // CRASH_OK
-  return internal::wrap<Cond>(internal::unwrap(*this), BoolType());
-}
-
 Scalar MultipleOf(Scalar value, int32_t multiple) {
   ABSL_CHECK(value.dtype().IsInt())  // CRASH_OK
       << "MultipleOf() requires an integer scalar";
@@ -73,14 +64,14 @@ Scalar MultipleOf(Scalar value, int32_t multiple) {
       value.dtype());
 }
 
-Scalar Scalar::MakeConstant(Literal value) const {
+Scalar Scalar::Coerce(Literal value) const {
   return MakeScalarConstant(dtype(), value);
 }
 
-Scalar I32(Literal value) { return MakeScalarConstant(Int32Type(), value); }
-Scalar U32(Literal value) { return MakeScalarConstant(UInt32Type(), value); }
-Scalar F32(Literal value) { return MakeScalarConstant(Float32Type(), value); }
+Scalar I32(Literal value) { return MakeScalarConstant(i32, value); }
+Scalar U32(Literal value) { return MakeScalarConstant(u32, value); }
+Scalar F32(Literal value) { return MakeScalarConstant(f32, value); }
 
-template struct internal::ElementwiseOps<Scalar, Cond>;
+template struct internal::ElementwiseOps<Scalar>;
 
 }  // namespace torch_tpu::kiln

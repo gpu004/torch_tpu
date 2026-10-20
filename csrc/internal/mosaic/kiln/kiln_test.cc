@@ -31,6 +31,7 @@
 
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "xla/hlo/testlib/filecheck.h"
@@ -40,6 +41,8 @@ namespace {
 
 using absl_testing::IsOk;
 using absl_testing::IsOkAndHolds;
+using testing::ElementsAre;
+using testing::IsEmpty;
 
 class KilnTest : public testing::Test {
  protected:
@@ -61,8 +64,6 @@ class KilnTest : public testing::Test {
 TEST_F(KilnTest, BlockwiseMatmul) {
   constexpr int64_t kM = 1024, kN = 512, kK = 2048;
   constexpr int64_t kTm = 256, kTn = 256, kTk = 512;
-  DType bf16 = BFloat16Type();
-  DType f32 = Float32Type();
 
   absl::StatusOr<Kernel> kernel = CreateKernel(
       GridSpec{
@@ -72,18 +73,16 @@ TEST_F(KilnTest, BlockwiseMatmul) {
                                   DimensionSemantics::kParallel,
                                   DimensionSemantics::kArbitrary},
       },
-      InSpec{{kTm, kTk}, bf16, IndexMap([] {
-               return IndexIndices{ProgramId(0), ProgramId(2)};
-             })},
-      InSpec{{kTk, kTn}, bf16, IndexMap([] {
-               return IndexIndices{ProgramId(2), ProgramId(1)};
-             })},
-      OutSpec{{kTm, kTn}, bf16, IndexMap([] {
+      InSpec{bf16(kTm, kTk),
+             IndexMap([] { return IndexIndices{ProgramId(0), ProgramId(2)}; })},
+      InSpec{bf16(kTk, kTn),
+             IndexMap([] { return IndexIndices{ProgramId(2), ProgramId(1)}; })},
+      OutSpec{bf16(kTm, kTn), IndexMap([] {
                 return IndexIndices{ProgramId(0), ProgramId(1)};
               })},
-      ScratchSpec{{kTm, kTn}, f32}, [&](Ref a, Ref b, Ref out, Ref acc) {
+      ScratchSpec{f32(kTm, kTn)}, [&](Ref a, Ref b, Ref out, Ref acc) {
         Scalar kk = ProgramId(2);
-        If(kk == 0, [&] { acc = Zeros({kTm, kTn}, f32); });
+        If(kk == 0, [&] { acc = Zeros(acc.shape()); });
         acc = Tile(acc) + Dot(Tile(a), Tile(b));
         If(kk == NumPrograms(2) - 1, [&] { out = Tile(acc).ToBF16(); });
       });
@@ -138,20 +137,17 @@ TEST_F(KilnTest, BlockwiseMatmul) {
 // SMEM and sums fixed-size chunks of each row.
 TEST_F(KilnTest, ScalarPrefetchAndLoop) {
   constexpr int64_t kRows = 64, kCols = 1024, kChunk = 128;
-  DType f32 = Float32Type();
-  DType i32 = Int32Type();
 
   IndexMap gathered = IndexMap(
       [] { return IndexIndices{Scalar(ScalarPrefetch(0)(ProgramId(0))), 0}; });
 
   absl::StatusOr<Kernel> kernel = CreateKernel(
       GridSpec{.name = "gather_rows", .grid = {kRows}},
-      ScalarPrefetchSpec{{kRows}, i32}, InSpec{{1, kCols}, f32, gathered},
-      OutSpec{{1, kChunk}, f32, IndexMap([] {
-                return IndexIndices{ProgramId(0), 0};
-              })},
+      ScalarPrefetchSpec{i32(kRows)}, InSpec{f32(1, kCols), gathered},
+      OutSpec{f32(1, kChunk),
+              IndexMap([] { return IndexIndices{ProgramId(0), 0}; })},
       [&](Ref /*indices*/, Ref rows, Ref out) {
-        Tile total = Zeros({1, kChunk}, f32);
+        Tile total = Zeros(f32(1, kChunk));
         for (int64_t c = 0; c < kCols; c += kChunk) {
           total = total + Tile(rows(0, Slice(c, kChunk)));
         }
@@ -194,18 +190,16 @@ TEST_F(KilnTest, ScalarPrefetchAndLoop) {
 }
 
 TEST_F(KilnTest, RefSliceRankCollapsing) {
-  DType f32 = Float32Type();
   // 4-D block: (1, 1, 32, 128). Slicing in4d(0, 0) yields a 2-D tile (32, 128).
   absl::StatusOr<Kernel> kernel =
       CreateKernel(GridSpec{.name = "rank_collapse", .grid = {1}},
-                   InSpec{.shape = {1, 1, 32, 128}, .dtype = f32},
-                   OutSpec{{32, 128}, f32}, [&](Ref in4d, Ref out2d) {
+                   InSpec{.shape = f32(1, 1, 32, 128)},
+                   OutSpec{.shape = f32(32, 128)}, [&](Ref in4d, Ref out2d) {
                      // in4d(0, 0) collapses the first 2 dimensions, resulting
                      // in rank 2.
                      Tile tile2d(in4d(0, 0));
                      EXPECT_EQ(tile2d.rank(), 2);
-                     EXPECT_EQ(tile2d.shape()[0], 32);
-                     EXPECT_EQ(tile2d.shape()[1], 128);
+                     EXPECT_THAT(tile2d.dims(), ElementsAre(32, 128));
                      out2d = tile2d;
                    });
   ASSERT_THAT(kernel, IsOk());
@@ -219,13 +213,10 @@ TEST_F(KilnTest, RefSliceRankCollapsing) {
 }
 
 TEST_F(KilnTest, LiteralOverloads) {
-  DType f32 = Float32Type();
-  DType i32 = Int32Type();
-
   absl::StatusOr<Kernel> kernel =
       CreateKernel(GridSpec{.name = "literal_ops", .grid = {1}},
-                   InSpec{{32, 128}, f32}, InSpec{{32, 128}, i32},
-                   OutSpec{{32, 128}, f32}, [&](Ref f_in, Ref i_in, Ref out) {
+                   InSpec{f32(32, 128)}, InSpec{i32(32, 128)},
+                   OutSpec{f32(32, 128)}, [&](Ref f_in, Ref i_in, Ref out) {
                      Tile f(f_in);
                      Tile i(i_in);
 
@@ -241,22 +232,20 @@ TEST_F(KilnTest, LiteralOverloads) {
                      Tile i_cmp = i == 0;
                      Tile i_combined = Select(i_cmp, i_add_int, 0);
 
-                     // Scalar with int and float literal + Cond <-> Scalar
+                     // Scalar with int and float literal + bool Scalar
                      Scalar s = ProgramId(0);
                      Scalar s_plus = s + 1;
-                     Cond c = s_plus == 1;
-                     Scalar s_bool = c;
+                     Scalar s_bool = s_plus == 1;
                      EXPECT_TRUE(s_bool.dtype().IsBool());
                      EXPECT_FALSE(s_bool.dtype().IsIntOrFloat());
-                     Cond c_roundtrip = static_cast<Cond>(s_bool);
 
                      If(
-                         c_roundtrip,
+                         s_bool,
                          [&] {
                            out = f_add_int + f_sub_float + f_scale + f_clamp +
                                  f_mask + i_combined.ToF32();
                          },
-                         [&] { out = Zeros({32, 128}, f32); });
+                         [&] { out = Zeros(out.shape()); });
                    });
   ASSERT_THAT(kernel, IsOk());
   ExpectKernelMatches(std::move(*kernel), R"(
@@ -281,7 +270,7 @@ TEST_F(KilnTest, LiteralOverloads) {
     CHECK:         %[[I_EQ:.*]] = arith.cmpi eq, %[[I]], %{{.*}} : vector<32x128xi32>
     CHECK:         %[[I_SEL:.*]] = arith.select %[[I_EQ]], %[[I_ADD]], %{{.*}} : vector<32x128xi1>, vector<32x128xi32>
 
-    // Cond -> Scalar -> Cond round trip still yields a plain i1 for scf.if.
+    // Bool Scalar yields a plain i1 for scf.if.
     CHECK:         %[[S_PLUS:.*]] = arith.addi %[[PID]], %{{.*}} : i32
     CHECK:         %[[COND:.*]] = arith.cmpi eq, %[[S_PLUS]], %{{.*}} : i32
     CHECK:         scf.if %[[COND]] {
@@ -300,35 +289,34 @@ TEST_F(KilnTest, LiteralOverloads) {
 }
 
 TEST_F(KilnTest, ScalarFloatOperations) {
-  DType f32 = Float32Type();
-  absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "scalar_float_ops", .grid = {1}},
-      InSpec{.shape = {32, 128}, .dtype = f32, .space = MemorySpace::kSmem},
-      OutSpec{.shape = {32, 128}, .dtype = f32, .space = MemorySpace::kSmem},
-      [&](Ref in, Ref out) {
-        Scalar sf = F32(2.5);
-        EXPECT_TRUE(sf.dtype().IsFloat());
-        EXPECT_FALSE(sf.dtype().IsInt());
+  absl::StatusOr<Kernel> kernel =
+      CreateKernel(GridSpec{.name = "scalar_float_ops", .grid = {1}},
+                   InSpec{.shape = f32(32, 128), .space = MemorySpace::kSmem},
+                   OutSpec{.shape = f32(32, 128), .space = MemorySpace::kSmem},
+                   [&](Ref in, Ref out) {
+                     Scalar sf = F32(2.5);
+                     EXPECT_TRUE(sf.dtype().IsFloat());
+                     EXPECT_FALSE(sf.dtype().IsInt());
 
-        Scalar sf2 = sf * 2.0;
-        Scalar sf3 = sf2 + 1.0;
-        Scalar sf_div = sf3 / 2.0;
-        Scalar sf_neg = -sf;
+                     Scalar sf2 = sf * 2.0;
+                     Scalar sf3 = sf2 + 1.0;
+                     Scalar sf_div = sf3 / 2.0;
+                     Scalar sf_neg = -sf;
 
-        Scalar sf_exp = Exp(sf);
-        Scalar sf_log = Log(sf);
-        Scalar sf_sqrt = Sqrt(sf);
-        Scalar sf_rsqrt = Rsqrt(sf);
-        Scalar sf_abs = Abs(sf_neg);
+                     Scalar sf_exp = Exp(sf);
+                     Scalar sf_log = Log(sf);
+                     Scalar sf_sqrt = Sqrt(sf);
+                     Scalar sf_rsqrt = Rsqrt(sf);
+                     Scalar sf_abs = Abs(sf_neg);
 
-        Scalar sf_sel = Select(sf > 1.0, sf, 0.0);
-        Scalar sf_min = Min(sf, 10.0);
-        Scalar sf_max = Max(sf, 0.0);
+                     Scalar sf_sel = Select(sf > 1.0, sf, 0.0);
+                     Scalar sf_min = Min(sf, 10.0);
+                     Scalar sf_max = Max(sf, 0.0);
 
-        Scalar loaded(in(0, 0));
-        out(0, 0) = loaded + sf_exp + sf_log + sf_sqrt + sf_rsqrt + sf_abs +
-                    sf_sel + sf_min + sf_max + sf_div;
-      });
+                     Scalar loaded(in(0, 0));
+                     out(0, 0) = loaded + sf_exp + sf_log + sf_sqrt + sf_rsqrt +
+                                 sf_abs + sf_sel + sf_min + sf_max + sf_div;
+                   });
   ASSERT_THAT(kernel, IsOk());
   ExpectKernelMatches(std::move(*kernel), R"(
     CHECK-LABEL: func.func @scalar_float_ops(
@@ -379,10 +367,9 @@ T Fmix32(T h) {
 }
 
 TEST_F(KilnTest, BitwiseOperations) {
-  DType u32 = UInt32Type();
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "bitwise_ops", .grid = {4}}, InSpec{{32, 128}, u32},
-      OutSpec{{32, 128}, u32}, [&](Ref in, Ref out) {
+      GridSpec{.name = "bitwise_ops", .grid = {4}}, InSpec{u32(32, 128)},
+      OutSpec{u32(32, 128)}, [&](Ref in, Ref out) {
         Scalar pid = ProgramId(0).AsType(u32);
         Scalar stream = Fmix32(pid ^ 0x9E3779B9u);
         Scalar shifted = (stream << 1) | (stream & 1);
@@ -390,7 +377,7 @@ TEST_F(KilnTest, BitwiseOperations) {
         Tile t(in);
         Tile hashed = Fmix32(t ^ shifted);
         Tile masked = (hashed & 0xFFFF) | (hashed >> 16);
-        Tile masked_signed = masked.AsType(Int32Type());
+        Tile masked_signed = masked.AsType(i32);
         out = Select(masked_signed >= 0, masked_signed, 0);
       });
   ASSERT_THAT(kernel, IsOk());
@@ -413,8 +400,7 @@ TEST_F(KilnTest, BitwiseOperations) {
 
     // Tile hash: the Scalar is splat once, then the same op sequence follows.
     CHECK:         %[[T:.*]] = vector.load %[[IN]]
-    CHECK:         %[[S_0D:.*]] = vector.broadcast %[[SHIFTED]] : i32 to vector<i32>
-    CHECK:         %[[S:.*]] = vector.broadcast %[[S_0D]] : vector<i32> to vector<32x128xi32>
+    CHECK:         %[[S:.*]] = vector.broadcast %[[SHIFTED]] : i32 to vector<32x128xi32>
     CHECK:         %[[TX:.*]] = arith.xori %[[T]], %[[S]] : vector<32x128xi32>
     CHECK:         arith.shrui %[[TX]], %{{.*}} : vector<32x128xi32>
     CHECK:         arith.muli %{{.*}}, %{{.*}} : vector<32x128xi32>
@@ -430,110 +416,196 @@ TEST_F(KilnTest, BitwiseOperations) {
   )");
 }
 
-TEST_F(KilnTest, TileScalarOperations) {
-  DType f32 = Float32Type();
-  DType i32 = Int32Type();
+TEST_F(KilnTest, TileScalarSplat) {
+  absl::StatusOr<Kernel> kernel = CreateKernel(
+      GridSpec{.name = "tile_scalar_splat", .grid = {1}}, InSpec{f32(32, 128)},
+      OutSpec{i32(32, 128)}, [&](Ref float_in, Ref out) {
+        Tile float_tile(float_in);
+        Scalar int_scalar = I32(42);
 
-  absl::StatusOr<Kernel> kernel =
-      CreateKernel(GridSpec{.name = "tile_scalar_ops", .grid = {2}},
-                   InSpec{{32, 128}, f32}, InSpec{{32, 128}, i32},
-                   OutSpec{{32, 128}, f32}, [&](Ref f_in, Ref i_in, Ref out) {
-                     Tile f(f_in);
-                     Tile i(i_in);
+        // Verify 0-D tile properties when splatted from a scalar.
+        Tile zero_dim_tile = Splat(int_scalar, {});
+        EXPECT_EQ(zero_dim_tile.rank(), 0);
+        EXPECT_THAT(zero_dim_tile.dims(), IsEmpty());
+        EXPECT_EQ(zero_dim_tile.dtype(), i32);
+        EXPECT_EQ(zero_dim_tile.shape(), i32());
 
-                     Scalar s_idx = ProgramId(0);
-                     Scalar s_f = F32(1.5);
-                     Scalar s_i = I32(42);
+        // Verify Tile::Splat broadcasts to the tile's dimensions while
+        // preserving the scalar's dtype.
+        Tile splatted_int_tile = float_tile.Splat(int_scalar);
+        EXPECT_EQ(splatted_int_tile.shape(), i32(32, 128));
 
-                     // Verify 0-D tile properties when constructed from a
-                     // scalar.
-                     Tile t_scalar(s_i);
-                     EXPECT_EQ(t_scalar.rank(), 0);
-                     EXPECT_TRUE(t_scalar.shape().empty());
-                     EXPECT_EQ(t_scalar.dtype(), i32);
-
-                     // Arithmetic: Tile & Scalar (both LHS and RHS)
-                     Tile f_add = f + s_f;
-                     Tile f_sub = s_f - f;
-                     Tile f_mul = f * s_idx.ToF32();
-                     Tile f_div = s_f / f;
-
-                     // Bitwise: Tile & Scalar
-                     Tile i_xor = i ^ s_i;
-                     Tile i_or = s_i | i;
-                     Tile i_and = i & s_i;
-                     Tile i_shl = i << s_i;
-                     Tile i_shr = i >> s_i;
-
-                     // Comparisons: produce mask tile
-                     Tile cmp1 = f > s_f;
-                     Tile cmp2 = s_f <= f;
-                     Tile cmp3 = i == s_i;
-                     Tile cmp4 = s_i != i;
-
-                     // Select with Scalar operands
-                     Tile w1 = Select(cmp1, f, s_f);
-                     Tile w2 = Select(cmp2, s_f, f);
-                     Tile w3 = Select(cmp3, s_f, 0.0);
-                     Tile w4 = Select(cmp4, s_f, s_f * 2.0);
-
-                     // Min/Max with Scalar
-                     Tile max_f = Max(f, s_f);
-                     Tile min_f = Min(s_f, f);
-
-                     out = f_add + f_sub + f_mul + f_div + i_xor.ToF32() +
-                           i_or.ToF32() + i_and.ToF32() + i_shl.ToF32() +
-                           i_shr.ToF32() + w1 + w2 + w3 + w4 + max_f + min_f;
-                   });
+        out = splatted_int_tile;
+      });
   ASSERT_THAT(kernel, IsOk());
   ExpectKernelMatches(std::move(*kernel), R"(
-    CHECK-LABEL: func.func @tile_scalar_ops(
-    CHECK-SAME:    %[[PID:arg[0-9]+]]: i32, %[[F_IN:arg[0-9]+]]: memref<32x128xf32, #tpu.memory_space<vmem>>, %[[I_IN:arg[0-9]+]]: memref<32x128xi32, #tpu.memory_space<vmem>>, %[[OUT:arg[0-9]+]]: memref<32x128xf32, #tpu.memory_space<vmem>>)
+    CHECK-LABEL: func.func @tile_scalar_splat(
+    CHECK-SAME:    %{{.*}}: i32, %[[FLOAT_IN:arg[0-9]+]]: memref<32x128xf32, #tpu.memory_space<vmem>>, %[[OUT:arg[0-9]+]]: memref<32x128xi32, #tpu.memory_space<vmem>>)
+    CHECK:         %[[INT_SCALAR:.*]] = arith.constant 42 : i32
+    CHECK:         vector.broadcast %[[INT_SCALAR]] : i32 to vector<i32>
+    CHECK:         %[[SPLATTED:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         tpu.vector_store %[[OUT]][%{{.*}}, %{{.*}}], %[[SPLATTED]]
+  )");
+}
+
+TEST_F(KilnTest, TileScalarArithmetic) {
+  absl::StatusOr<Kernel> kernel = CreateKernel(
+      GridSpec{.name = "tile_scalar_arith", .grid = {2}}, InSpec{f32(32, 128)},
+      InSpec{i32(32, 128)}, OutSpec{f32(32, 128)},
+      [&](Ref float_in, Ref int_in, Ref out) {
+        Tile float_tile(float_in);
+        Tile int_tile(int_in);
+
+        Scalar program_id = ProgramId(0);
+        Scalar float_scalar = F32(1.5);
+        Scalar int_scalar = I32(42);
+
+        Tile sum = float_tile + float_scalar;
+        Tile diff = float_scalar - float_tile;
+        Tile product = float_tile * program_id.ToF32();
+        Tile quotient = float_scalar / float_tile;
+        Tile max_tile = Max(float_tile, float_scalar);
+        Tile min_tile = Min(float_scalar, float_tile);
+
+        Tile tile_mod_scalar = int_tile % int_scalar;
+        Tile scalar_mod_tile = int_scalar % int_tile;
+
+        out = sum + diff + product + quotient + max_tile + min_tile +
+              tile_mod_scalar.ToF32() + scalar_mod_tile.ToF32();
+      });
+  ASSERT_THAT(kernel, IsOk());
+  ExpectKernelMatches(std::move(*kernel), R"(
+    CHECK-LABEL: func.func @tile_scalar_arith(
+    CHECK-SAME:    %[[PID:arg[0-9]+]]: i32, %[[FLOAT_IN:arg[0-9]+]]: memref<32x128xf32, #tpu.memory_space<vmem>>, %[[INT_IN:arg[0-9]+]]: memref<32x128xi32, #tpu.memory_space<vmem>>, %[[OUT:arg[0-9]+]]: memref<32x128xf32, #tpu.memory_space<vmem>>)
     CHECK-SAME:    iteration_bounds = array<i64: 2>
-    CHECK:         %[[F:.*]] = vector.load %[[F_IN]]
-    CHECK:         %[[I:.*]] = vector.load %[[I_IN]]
-    CHECK:         %[[S_F:.*]] = arith.constant 1.500000e+00 : f32
-    CHECK:         %[[S_I:.*]] = arith.constant 42 : i32
+    CHECK:         %[[FLOAT_TILE:.*]] = vector.load %[[FLOAT_IN]]
+    CHECK:         %[[INT_TILE:.*]] = vector.load %[[INT_IN]]
+    CHECK:         %[[FLOAT_SCALAR:.*]] = arith.constant 1.500000e+00 : f32
+    CHECK:         %[[INT_SCALAR:.*]] = arith.constant 42 : i32
+    CHECK:         %[[FLOAT_SPLAT:.*]] = vector.broadcast %[[FLOAT_SCALAR]] : f32 to vector<32x128xf32>
+    CHECK:         arith.addf %[[FLOAT_TILE]], %[[FLOAT_SPLAT]] : vector<32x128xf32>
+    CHECK:         arith.subf %{{.*}}, %[[FLOAT_TILE]] : vector<32x128xf32>
+    CHECK:         %[[PID_F32:.*]] = arith.sitofp %[[PID]] : i32 to f32
+    CHECK:         %[[PID_SPLAT:.*]] = vector.broadcast %[[PID_F32]] : f32 to vector<32x128xf32>
+    CHECK:         arith.mulf %[[FLOAT_TILE]], %[[PID_SPLAT]] : vector<32x128xf32>
+    CHECK:         arith.divf %{{.*}}, %[[FLOAT_TILE]] : vector<32x128xf32>
+    CHECK:         arith.maximumf %[[FLOAT_TILE]], %{{.*}} : vector<32x128xf32>
+    CHECK:         arith.minimumf %{{.*}}, %[[FLOAT_TILE]] : vector<32x128xf32>
+    CHECK:         %[[INT_SPLAT_RHS:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         arith.remsi %[[INT_TILE]], %[[INT_SPLAT_RHS]] : vector<32x128xi32>
+    CHECK:         %[[INT_SPLAT_LHS:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         arith.remsi %[[INT_SPLAT_LHS]], %[[INT_TILE]] : vector<32x128xi32>
+    CHECK:         tpu.vector_store %[[OUT]]
+  )");
+}
 
-    // Tile(scalar) is a 0-D vector.
-    CHECK:         vector.broadcast %[[S_I]] : i32 to vector<i32>
+TEST_F(KilnTest, TileScalarBitwise) {
+  absl::StatusOr<Kernel> kernel = CreateKernel(
+      GridSpec{.name = "tile_scalar_bitwise", .grid = {1}},
+      InSpec{i32(32, 128)}, OutSpec{i32(32, 128)}, [&](Ref int_in, Ref out) {
+        Tile int_tile(int_in);
+        Scalar int_scalar = I32(42);
 
-    // Tile <op> Scalar splats the scalar through a 0-D vector and keeps operand
-    // order.
-    CHECK:         %[[S_F_0D:.*]] = vector.broadcast %[[S_F]] : f32 to vector<f32>
-    CHECK:         %[[S_F_V:.*]] = vector.broadcast %[[S_F_0D]] : vector<f32> to vector<32x128xf32>
-    CHECK:         arith.addf %[[F]], %[[S_F_V]] : vector<32x128xf32>
-    CHECK:         arith.subf %{{.*}}, %[[F]] : vector<32x128xf32>
-    CHECK:         %[[PID_F:.*]] = arith.sitofp %[[PID]] : i32 to f32
-    CHECK:         vector.broadcast %[[PID_F]] : f32 to vector<f32>
-    CHECK:         arith.mulf %[[F]], %{{.*}} : vector<32x128xf32>
-    CHECK:         arith.divf %{{.*}}, %[[F]] : vector<32x128xf32>
-    CHECK:         arith.xori %[[I]], %{{.*}} : vector<32x128xi32>
-    CHECK:         arith.ori %{{.*}}, %[[I]] : vector<32x128xi32>
-    CHECK:         arith.andi %[[I]], %{{.*}} : vector<32x128xi32>
-    CHECK:         arith.shli %[[I]], %{{.*}} : vector<32x128xi32>
-    CHECK:         arith.shrsi %[[I]], %{{.*}} : vector<32x128xi32>
-    CHECK:         %[[CMP1:.*]] = arith.cmpf ogt, %[[F]], %{{.*}} : vector<32x128xf32>
-    CHECK:         %[[CMP2:.*]] = arith.cmpf ole, %{{.*}}, %[[F]] : vector<32x128xf32>
-    CHECK:         %[[CMP3:.*]] = arith.cmpi eq, %[[I]], %{{.*}} : vector<32x128xi32>
-    CHECK:         %[[CMP4:.*]] = arith.cmpi ne, %{{.*}}, %[[I]] : vector<32x128xi32>
-    CHECK:         arith.select %[[CMP1]], %[[F]], %{{.*}} : vector<32x128xi1>, vector<32x128xf32>
-    CHECK:         arith.select %[[CMP2]], %{{.*}}, %[[F]] : vector<32x128xi1>, vector<32x128xf32>
-    CHECK:         arith.select %[[CMP3]], %{{.*}}, %{{.*}} : vector<32x128xi1>, vector<32x128xf32>
-    CHECK:         arith.select %[[CMP4]], %{{.*}}, %{{.*}} : vector<32x128xi1>, vector<32x128xf32>
-    CHECK:         arith.maximumf %[[F]], %{{.*}} : vector<32x128xf32>
-    CHECK:         arith.minimumf %{{.*}}, %[[F]] : vector<32x128xf32>
+        Tile bitwise_xor = int_tile ^ int_scalar;
+        Tile bitwise_or = int_scalar | int_tile;
+        Tile bitwise_and = int_tile & int_scalar;
+        Tile tile_shl_scalar = int_tile << int_scalar;
+        Tile scalar_shl_tile = int_scalar << int_tile;
+        Tile tile_shr_scalar = int_tile >> int_scalar;
+        Tile scalar_shr_tile = int_scalar >> int_tile;
+
+        out = bitwise_xor + bitwise_or + bitwise_and + tile_shl_scalar +
+              scalar_shl_tile + tile_shr_scalar + scalar_shr_tile;
+      });
+  ASSERT_THAT(kernel, IsOk());
+  ExpectKernelMatches(std::move(*kernel), R"(
+    CHECK-LABEL: func.func @tile_scalar_bitwise(
+    CHECK-SAME:    %{{.*}}: i32, %[[INT_IN:arg[0-9]+]]: memref<32x128xi32, #tpu.memory_space<vmem>>, %[[OUT:arg[0-9]+]]: memref<32x128xi32, #tpu.memory_space<vmem>>)
+    CHECK:         %[[INT_TILE:.*]] = vector.load %[[INT_IN]]
+    CHECK:         %[[INT_SCALAR:.*]] = arith.constant 42 : i32
+    CHECK:         %[[XOR_SPLAT:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         arith.xori %[[INT_TILE]], %[[XOR_SPLAT]] : vector<32x128xi32>
+    CHECK:         %[[OR_SPLAT:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         arith.ori %[[INT_TILE]], %[[OR_SPLAT]] : vector<32x128xi32>
+    CHECK:         %[[AND_SPLAT:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         arith.andi %[[INT_TILE]], %[[AND_SPLAT]] : vector<32x128xi32>
+    CHECK:         %[[SHL_RHS_SPLAT:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         arith.shli %[[INT_TILE]], %[[SHL_RHS_SPLAT]] : vector<32x128xi32>
+    CHECK:         %[[SHL_LHS_SPLAT:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         arith.shli %[[SHL_LHS_SPLAT]], %[[INT_TILE]] : vector<32x128xi32>
+    CHECK:         %[[SHR_RHS_SPLAT:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         arith.shrsi %[[INT_TILE]], %[[SHR_RHS_SPLAT]] : vector<32x128xi32>
+    CHECK:         %[[SHR_LHS_SPLAT:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         arith.shrsi %[[SHR_LHS_SPLAT]], %[[INT_TILE]] : vector<32x128xi32>
+    CHECK:         tpu.vector_store %[[OUT]]
+  )");
+}
+
+TEST_F(KilnTest, TileScalarComparisonAndSelect) {
+  absl::StatusOr<Kernel> kernel = CreateKernel(
+      GridSpec{.name = "tile_scalar_cmp_select", .grid = {1}},
+      InSpec{f32(32, 128)}, InSpec{i32(32, 128)}, OutSpec{f32(32, 128)},
+      [&](Ref float_in, Ref int_in, Ref out) {
+        Tile float_tile(float_in);
+        Tile int_tile(int_in);
+
+        Scalar float_scalar = F32(1.5);
+        Scalar int_scalar = I32(42);
+
+        Tile gt_mask = float_tile > float_scalar;
+        Tile le_mask = float_scalar <= float_tile;
+        Tile eq_mask = int_tile == int_scalar;
+        Tile ne_mask = int_scalar != int_tile;
+
+        Tile select_tile_scalar = Select(gt_mask, float_tile, float_scalar);
+        Tile select_scalar_tile = Select(le_mask, float_scalar, float_tile);
+        Tile select_scalar_literal = Select(eq_mask, float_scalar, 0.0);
+        Tile select_scalar_scalar =
+            Select(ne_mask, float_scalar, float_scalar * 2.0);
+        Tile select_literal_scalar = Select(eq_mask, 0.0, float_scalar);
+
+        out = select_tile_scalar + select_scalar_tile + select_scalar_literal +
+              select_scalar_scalar + select_literal_scalar;
+      });
+  ASSERT_THAT(kernel, IsOk());
+  ExpectKernelMatches(std::move(*kernel), R"(
+    CHECK-LABEL: func.func @tile_scalar_cmp_select(
+    CHECK-SAME:    %{{.*}}: i32, %[[FLOAT_IN:arg[0-9]+]]: memref<32x128xf32, #tpu.memory_space<vmem>>, %[[INT_IN:arg[0-9]+]]: memref<32x128xi32, #tpu.memory_space<vmem>>, %[[OUT:arg[0-9]+]]: memref<32x128xf32, #tpu.memory_space<vmem>>)
+    CHECK:         %[[FLOAT_TILE:.*]] = vector.load %[[FLOAT_IN]]
+    CHECK:         %[[INT_TILE:.*]] = vector.load %[[INT_IN]]
+    CHECK:         %[[FLOAT_SCALAR:.*]] = arith.constant 1.500000e+00 : f32
+    CHECK:         %[[INT_SCALAR:.*]] = arith.constant 42 : i32
+    CHECK:         %[[GT_SPLAT:.*]] = vector.broadcast %[[FLOAT_SCALAR]] : f32 to vector<32x128xf32>
+    CHECK:         %[[GT_MASK:.*]] = arith.cmpf ogt, %[[FLOAT_TILE]], %[[GT_SPLAT]] : vector<32x128xf32>
+    CHECK:         %[[LE_SPLAT:.*]] = vector.broadcast %[[FLOAT_SCALAR]] : f32 to vector<32x128xf32>
+    CHECK:         %[[LE_MASK:.*]] = arith.cmpf oge, %[[FLOAT_TILE]], %[[LE_SPLAT]] : vector<32x128xf32>
+    CHECK:         %[[EQ_SPLAT:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         %[[EQ_MASK:.*]] = arith.cmpi eq, %[[INT_TILE]], %[[EQ_SPLAT]] : vector<32x128xi32>
+    CHECK:         %[[NE_SPLAT:.*]] = vector.broadcast %[[INT_SCALAR]] : i32 to vector<32x128xi32>
+    CHECK:         %[[NE_MASK:.*]] = arith.cmpi ne, %[[INT_TILE]], %[[NE_SPLAT]] : vector<32x128xi32>
+    CHECK:         %[[SEL_TS_SPLAT:.*]] = vector.broadcast %[[FLOAT_SCALAR]] : f32 to vector<32x128xf32>
+    CHECK:         arith.select %[[GT_MASK]], %[[FLOAT_TILE]], %[[SEL_TS_SPLAT]] : vector<32x128xi1>, vector<32x128xf32>
+    CHECK:         %[[SEL_ST_SPLAT:.*]] = vector.broadcast %[[FLOAT_SCALAR]] : f32 to vector<32x128xf32>
+    CHECK:         arith.select %[[LE_MASK]], %[[SEL_ST_SPLAT]], %[[FLOAT_TILE]] : vector<32x128xi1>, vector<32x128xf32>
+    CHECK:         %[[SEL_SL_SPLAT:.*]] = vector.broadcast %[[FLOAT_SCALAR]] : f32 to vector<32x128xf32>
+    CHECK:         %[[ZERO_SL:.*]] = arith.constant dense<0.000000e+00> : vector<32x128xf32>
+    CHECK:         arith.select %[[EQ_MASK]], %[[SEL_SL_SPLAT]], %[[ZERO_SL]] : vector<32x128xi1>, vector<32x128xf32>
+    CHECK:         %[[TWO:.*]] = arith.constant 2.000000e+00 : f32
+    CHECK:         %[[SCALED_SCALAR:.*]] = arith.mulf %[[FLOAT_SCALAR]], %[[TWO]] : f32
+    CHECK:         %[[SEL_SS_TRUE:.*]] = vector.broadcast %[[FLOAT_SCALAR]] : f32 to vector<32x128xf32>
+    CHECK:         %[[SEL_SS_FALSE:.*]] = vector.broadcast %[[SCALED_SCALAR]] : f32 to vector<32x128xf32>
+    CHECK:         arith.select %[[NE_MASK]], %[[SEL_SS_TRUE]], %[[SEL_SS_FALSE]] : vector<32x128xi1>, vector<32x128xf32>
+    CHECK:         %[[SEL_LS_SPLAT:.*]] = vector.broadcast %[[FLOAT_SCALAR]] : f32 to vector<32x128xf32>
+    CHECK:         %[[ZERO_LS:.*]] = arith.constant dense<0.000000e+00> : vector<32x128xf32>
+    CHECK:         arith.select %[[EQ_MASK]], %[[ZERO_LS]], %[[SEL_LS_SPLAT]] : vector<32x128xi1>, vector<32x128xf32>
     CHECK:         tpu.vector_store %[[OUT]]
   )");
 }
 
 TEST_F(KilnTest, RotateGatherExtractBitcastAndMaskedStore) {
-  DType f32 = Float32Type();
-  DType i32 = Int32Type();
-
   absl::StatusOr<Kernel> kernel = CreateKernel(
       GridSpec{.name = "rotate_gather_extract_bitcast_store", .grid = {1}},
-      InSpec{{8, 128}, f32}, OutSpec{{1, 128}, i32}, [&](Ref in, Ref out) {
+      InSpec{f32(8, 128)}, OutSpec{i32(1, 128)}, [&](Ref in, Ref out) {
         Scalar step = ProgramId(0);
         Tile rotated = Rotate(Tile(in), 8 - (step & 7), /*axis=*/0);
         Tile row0 = rotated.Slice({0, 0}, {1, 128});
@@ -541,7 +613,7 @@ TEST_F(KilnTest, RotateGatherExtractBitcastAndMaskedStore) {
         Scalar lane_f32 = Extract(gathered, {0, 0});
         Scalar lane_bits = Bitcast(lane_f32, i32);
         Tile row_bits = Bitcast(row0, i32);
-        Tile mask = Iota({1, 128}, i32, /*axis=*/1) == (step & 127);
+        Tile mask = Iota(i32(1, 128), /*axis=*/1) == (step & 127);
         Store(out, row_bits + lane_bits, mask);
       });
   ASSERT_THAT(kernel, IsOk());
@@ -563,23 +635,18 @@ TEST_F(KilnTest, RotateGatherExtractBitcastAndMaskedStore) {
     CHECK:         %[[IOTA:.*]] = tpu.iota {dimensions = array<i32: 1>} : vector<1x128xi32>
     CHECK:         %[[C127:.*]] = arith.constant 127 : i32
     CHECK:         %[[LANE_ID:.*]] = arith.andi %[[STEP]], %[[C127]] : i32
-    CHECK:         %[[LANE_ID_0D:.*]] = vector.broadcast %[[LANE_ID]] : i32 to vector<i32>
-    CHECK:         %[[LANE_ID_V:.*]] = vector.broadcast %[[LANE_ID_0D]] : vector<i32> to vector<1x128xi32>
+    CHECK:         %[[LANE_ID_V:.*]] = vector.broadcast %[[LANE_ID]] : i32 to vector<1x128xi32>
     CHECK:         %[[MASK:.*]] = arith.cmpi eq, %[[IOTA]], %[[LANE_ID_V]] : vector<1x128xi32>
-    CHECK:         %[[LANE_BITS_0D:.*]] = vector.broadcast %[[LANE_BITS]] : i32 to vector<i32>
-    CHECK:         %[[LANE_BITS_V:.*]] = vector.broadcast %[[LANE_BITS_0D]] : vector<i32> to vector<1x128xi32>
+    CHECK:         %[[LANE_BITS_V:.*]] = vector.broadcast %[[LANE_BITS]] : i32 to vector<1x128xi32>
     CHECK:         %[[SUM:.*]] = arith.addi %[[ROW_BITS]], %[[LANE_BITS_V]] : vector<1x128xi32>
     CHECK:         tpu.vector_store %[[OUT]][%{{.*}}, %{{.*}}], %[[SUM]] masked %[[MASK]]
   )");
 }
 
 TEST_F(KilnTest, ForLoopWithInductionVarAndBounds) {
-  DType f32 = Float32Type();
-  DType i32 = Int32Type();
-
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "for_loop", .grid = {1}}, InSpec{{32, 128}, f32},
-      OutSpec{{32, 128}, f32}, [&](Ref in, Ref out) {
+      GridSpec{.name = "for_loop", .grid = {1}}, InSpec{f32(32, 128)},
+      OutSpec{f32(32, 128)}, [&](Ref in, Ref out) {
         // Loop with static bounds.
         For(0, 10, [&](Scalar i) {
           EXPECT_TRUE(i.dtype().IsInt());
@@ -632,15 +699,18 @@ TEST_F(KilnTest, ForLoopWithInductionVarAndBounds) {
 
 TEST_F(KilnTest, ScalarMismatchedTypesFail) {
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "mismatched", .grid = {1}},
-      InSpec{{32, 128}, Float32Type()}, InSpec{{32, 128}, Int32Type()},
-      InSpec{{32, 128}, UInt32Type()}, OutSpec{{32, 128}, Float32Type()},
+      GridSpec{.name = "mismatched", .grid = {1}}, InSpec{f32(32, 128)},
+      InSpec{i32(32, 128)}, InSpec{u32(32, 128)}, OutSpec{f32(32, 128)},
       [&](Ref f_in, Ref i_in, Ref u_in, Ref out) {
         Scalar s_i = I32(1);
         Scalar s_u = U32(1);
         Scalar s_f = F32(1.0);
         EXPECT_DEATH(s_i + s_f, "\\+ requires operands of the same dtype");
         EXPECT_DEATH(s_i + s_u, "\\+ requires operands of the same dtype");
+        EXPECT_DEATH(!s_i, "! requires a bool operand");
+        EXPECT_DEATH(If(s_i, [&] {}),
+                     "If\\(\\) condition must be a bool scalar");
+        EXPECT_DEATH(Select(s_i, s_i, s_i), "Select\\(\\) mask must be bool");
         EXPECT_DEATH(For(s_f, [&](Scalar) {}),
                      "IndexArg requires an integer scalar");
 
@@ -654,6 +724,7 @@ TEST_F(KilnTest, ScalarMismatchedTypesFail) {
         EXPECT_DEATH(Min(t_i, t_u),
                      "Min\\(\\) requires operands of the same dtype");
         EXPECT_DEATH(t_f & t_f, "& requires integer or bool operands");
+        EXPECT_DEATH(!t_i, "! requires a bool operand");
 
         EXPECT_DEATH(f_in(0, 0, 0), "Too many slice indices");
         EXPECT_DEATH(f_in(0, Slice(0, 0)), "Slice size must be positive");
@@ -668,7 +739,6 @@ TEST_F(KilnTest, ScalarMismatchedTypesFail) {
 }
 
 TEST_F(KilnTest, DTypeProperties) {
-  DType f32 = Float32Type();
   EXPECT_TRUE(f32.IsFloat());
   EXPECT_FALSE(f32.IsInt());
   EXPECT_FALSE(f32.IsSigned());
@@ -681,7 +751,6 @@ TEST_F(KilnTest, DTypeProperties) {
   ss << f32;
   EXPECT_EQ(ss.str(), "f32");
 
-  DType i32 = Int32Type();
   EXPECT_FALSE(i32.IsFloat());
   EXPECT_TRUE(i32.IsInt());
   EXPECT_TRUE(i32.IsSigned());
@@ -694,7 +763,6 @@ TEST_F(KilnTest, DTypeProperties) {
   EXPECT_EQ(i32.GetIntOrFloatBitWidth(), 32);
   EXPECT_EQ(i32.ToString(), "i32");
 
-  DType u8 = UInt8Type();
   EXPECT_FALSE(u8.IsFloat());
   EXPECT_TRUE(u8.IsInt());
   EXPECT_FALSE(u8.IsSigned());
@@ -704,13 +772,11 @@ TEST_F(KilnTest, DTypeProperties) {
   EXPECT_EQ(u8.GetIntOrFloatBitWidth(), 8);
   EXPECT_EQ(u8.ToString(), "u8");
 
-  DType u16 = UInt16Type();
   EXPECT_TRUE(u16.IsUnsigned());
   EXPECT_TRUE(u16.IsUnsignedInteger(16));
   EXPECT_EQ(u16.GetIntOrFloatBitWidth(), 16);
   EXPECT_EQ(u16.ToString(), "u16");
 
-  DType u32 = UInt32Type();
   EXPECT_FALSE(u32.IsFloat());
   EXPECT_TRUE(u32.IsInt());
   EXPECT_FALSE(u32.IsSigned());
@@ -720,62 +786,63 @@ TEST_F(KilnTest, DTypeProperties) {
   EXPECT_EQ(u32.GetIntOrFloatBitWidth(), 32);
   EXPECT_EQ(u32.ToString(), "u32");
 
-  DType u64 = UInt64Type();
   EXPECT_TRUE(u64.IsUnsigned());
   EXPECT_TRUE(u64.IsUnsignedInteger(64));
   EXPECT_EQ(u64.GetIntOrFloatBitWidth(), 64);
   EXPECT_EQ(u64.ToString(), "u64");
 
-  EXPECT_EQ(f32, Float32Type());
+  EXPECT_EQ(f32, DType(DType::Kind::kF32));
   EXPECT_NE(f32, i32);
   EXPECT_NE(u32, i32);
 }
 
 TEST_F(KilnTest, TypeHelpersInsideKernel) {
-  DType f32 = Float32Type();
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "type_helpers", .grid = {1}}, InSpec{{32, 128}, f32},
-      OutSpec{{32, 128}, f32}, [&](Ref in, Ref out) {
-        EXPECT_TRUE(BoolType().IsBool());
-        EXPECT_FALSE(BoolType().IsIntOrFloat());
-        EXPECT_TRUE(Int8Type().IsSignedInteger(8));
-        EXPECT_TRUE(Int16Type().IsSignedInteger(16));
-        EXPECT_TRUE(Int32Type().IsSignedInteger(32));
-        EXPECT_TRUE(Int64Type().IsSignedInteger(64));
-        EXPECT_TRUE(UInt8Type().IsUnsignedInteger(8));
-        EXPECT_TRUE(UInt16Type().IsUnsignedInteger(16));
-        EXPECT_TRUE(UInt32Type().IsUnsignedInteger(32));
-        EXPECT_TRUE(UInt64Type().IsUnsignedInteger(64));
-        EXPECT_TRUE(Float16Type().IsFloat());
-        EXPECT_EQ(Float16Type().GetIntOrFloatBitWidth(), 16);
-        EXPECT_TRUE(Float32Type().IsFloat());
-        EXPECT_EQ(Float32Type().GetIntOrFloatBitWidth(), 32);
-        EXPECT_TRUE(BFloat16Type().IsFloat());
-        EXPECT_EQ(BFloat16Type().GetIntOrFloatBitWidth(), 16);
+      GridSpec{.name = "type_helpers", .grid = {1}}, InSpec{f32(32, 128)},
+      OutSpec{f32(32, 128)}, [&](Ref in, Ref out) {
+        EXPECT_TRUE(bool_.IsBool());
+        EXPECT_FALSE(bool_.IsIntOrFloat());
+        EXPECT_TRUE(i8.IsSignedInteger(8));
+        EXPECT_TRUE(i16.IsSignedInteger(16));
+        EXPECT_TRUE(i32.IsSignedInteger(32));
+        EXPECT_TRUE(i64.IsSignedInteger(64));
+        EXPECT_TRUE(u8.IsUnsignedInteger(8));
+        EXPECT_TRUE(u16.IsUnsignedInteger(16));
+        EXPECT_TRUE(u32.IsUnsignedInteger(32));
+        EXPECT_TRUE(u64.IsUnsignedInteger(64));
+        EXPECT_TRUE(f16.IsFloat());
+        EXPECT_EQ(f16.GetIntOrFloatBitWidth(), 16);
+        EXPECT_TRUE(f32.IsFloat());
+        EXPECT_EQ(f32.GetIntOrFloatBitWidth(), 32);
+        EXPECT_TRUE(bf16.IsFloat());
+        EXPECT_EQ(bf16.GetIntOrFloatBitWidth(), 16);
         out = Tile(in);
       });
   ASSERT_THAT(kernel, IsOk());
 }
 
 TEST_F(KilnTest, DTypeInTileAndScalarOps) {
-  DType f32 = Float32Type();
-  DType bf16 = BFloat16Type();
-  DType i32 = Int32Type();
-
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "dtype_ops", .grid = {1}}, InSpec{{32, 128}, f32},
-      OutSpec{{32, 128}, f32}, [&](Ref in, Ref out) {
+      GridSpec{.name = "dtype_ops", .grid = {1}}, InSpec{f32(32, 128)},
+      OutSpec{f32(32, 128)}, [&](Ref in, Ref out) {
         EXPECT_EQ(in.dtype(), f32);
         EXPECT_EQ(out.dtype(), f32);
+        EXPECT_EQ(in.shape(), f32(32, 128));
+        EXPECT_EQ(out.shape(), Shape({32, 128}, f32));
 
         Tile t(in);
         EXPECT_EQ(t.dtype(), f32);
+        EXPECT_EQ(t.shape(), f32(32, 128));
+        EXPECT_EQ(t.shape().rank(), 2);
 
         Tile t_bf16 = t.ToBF16();
         EXPECT_EQ(t_bf16.dtype(), bf16);
+        EXPECT_EQ(t_bf16.shape(), bf16(32, 128));
+        EXPECT_NE(t_bf16.shape(), t.shape());
 
         Tile t_i32 = t.ToI32();
         EXPECT_EQ(t_i32.dtype(), i32);
+        EXPECT_EQ(t_i32.shape(), i32(in.dims()));
 
         Scalar s = ProgramId(0);
         EXPECT_EQ(s.dtype(), i32);
@@ -783,8 +850,15 @@ TEST_F(KilnTest, DTypeInTileAndScalarOps) {
         Scalar s_f32 = s.AsType(f32);
         EXPECT_EQ(s_f32.dtype(), f32);
 
-        Tile z = Zeros({32, 128}, f32);
+        Tile z = Zeros(in.shape());
         EXPECT_EQ(z.dtype(), f32);
+        EXPECT_EQ(z.shape(), in.shape());
+
+        Tile f = Full(t.shape(), /*value=*/3.0);
+        EXPECT_EQ(f.shape(), f32(32, 128));
+
+        Tile ninf = NInf(f32({32, 128}));
+        EXPECT_EQ(ninf.shape(), f32(32, 128));
 
         out = t_bf16.ToF32();
       });
@@ -802,12 +876,9 @@ TEST_F(KilnTest, DTypeInTileAndScalarOps) {
 }
 
 TEST_F(KilnTest, SimplifiedOverloadsAndBounds) {
-  DType f32 = Float32Type();
-  DType i32 = Int32Type();
-
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "simplified_ops", .grid = {1}}, InSpec{{32, 128}, f32},
-      OutSpec{{32, 128}, f32}, [&](Ref in, Ref out) {
+      GridSpec{.name = "simplified_ops", .grid = {1}}, InSpec{f32(32, 128)},
+      OutSpec{f32(32, 128)}, [&](Ref in, Ref out) {
         Scalar zero = I32(0);
         Scalar ten = I32(10);
 
@@ -835,11 +906,18 @@ TEST_F(KilnTest, SimplifiedOverloadsAndBounds) {
         EXPECT_EQ(max2.dtype(), i32);
 
         // Select with literals.
-        Cond cond = shift_val == 2;
+        Scalar cond = shift_val == 2;
         Scalar sel1 = Select(cond, shift_val, 0);
         Scalar sel2 = Select(cond, 0, shift_val);
         EXPECT_EQ(sel1.dtype(), i32);
         EXPECT_EQ(sel2.dtype(), i32);
+
+        // Logical ops with literals and on tiles.
+        Scalar s_logic = (cond & true) | (false | !cond);
+        EXPECT_EQ(s_logic.dtype(), bool_);
+        Tile t_cond = Tile(in) > 0.0;
+        Tile t_logic = (t_cond & true) | (false | !t_cond);
+        EXPECT_EQ(t_logic.dtype(), bool_);
 
         // Slicing with IndexArg and 0-arg operator().
         Ref in_full = in();
@@ -852,7 +930,7 @@ TEST_F(KilnTest, SimplifiedOverloadsAndBounds) {
         EXPECT_EQ(in_2d.rank(), 2);
 
         // Tile modulo with Tile and Literal.
-        Tile iota = Iota({32, 128}, i32, 1);
+        Tile iota = Iota(i32(32, 128), /*axis=*/1);
         Tile mod1 = iota % 4;
         Tile mod2 = 100 % (iota + 1);
         Tile mod3 = mod1 % mod2;
@@ -890,6 +968,15 @@ TEST_F(KilnTest, SimplifiedOverloadsAndBounds) {
     CHECK:         arith.select %[[COND]], %[[TWO]], %{{.*}} : i32
     CHECK:         arith.select %[[COND]], %{{.*}}, %[[TWO]] : i32
 
+    // Logical ops with literals and on tiles.
+    CHECK:         arith.andi %[[COND]], %{{.*}} : i1
+    CHECK:         arith.xori %[[COND]], %{{.*}} : i1
+    CHECK:         arith.ori %{{.*}}, %{{.*}} : i1
+    CHECK:         %[[T_COND:.*]] = arith.cmpf ogt
+    CHECK:         arith.andi %[[T_COND]], %{{.*}} : vector<32x128xi1>
+    CHECK:         arith.xori %[[T_COND]], %{{.*}} : vector<32x128xi1>
+    CHECK:         arith.ori %{{.*}}, %{{.*}} : vector<32x128xi1>
+
     // Ref slicing with an IndexArg (dynamic index / dynamic slice start).
     CHECK:         %[[ROW:.*]] = tpu.memref_slice %[[IN]][%[[ZERO]], %{{.*}}] : memref<32x128xf32, #tpu.memory_space<vmem>> -> memref<1x128xf32, #tpu.memory_space<vmem>>
     CHECK:         tpu.memref_squeeze %[[ROW]] : memref<1x128xf32, #tpu.memory_space<vmem>> -> memref<128xf32, #tpu.memory_space<vmem>>
@@ -909,10 +996,9 @@ TEST_F(KilnTest, SimplifiedOverloadsAndBounds) {
 }
 
 TEST_F(KilnTest, UnsignedOperations) {
-  DType u32 = UInt32Type();
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "unsigned_ops", .grid = {1}}, InSpec{{32, 128}, u32},
-      InSpec{{32, 128}, u32}, OutSpec{{32, 128}, u32},
+      GridSpec{.name = "unsigned_ops", .grid = {1}}, InSpec{u32(32, 128)},
+      InSpec{u32(32, 128)}, OutSpec{u32(32, 128)},
       [&](Ref in_a, Ref in_b, Ref out) {
         Tile a(in_a);
         Tile b(in_b);
@@ -954,7 +1040,7 @@ TEST_F(KilnTest, UnsignedOperations) {
         Scalar s_div = s_u / U32(2);
         Scalar s_rem = s_u % U32(5);
         Scalar s_shr = s_u >> U32(1);
-        Cond s_lt = s_u < U32(100);
+        Scalar s_lt = s_u < U32(100);
 
         Tile s_tile = Splat(s_div + s_rem + s_shr, {32, 128});
         If(s_lt, [&] {
@@ -995,15 +1081,9 @@ TEST_F(KilnTest, UnsignedOperations) {
 }
 
 TEST_F(KilnTest, UnsignedAndSignedCasts) {
-  DType u32 = UInt32Type();
-  DType u8 = UInt8Type();
-  DType i8 = Int8Type();
-  DType i32 = Int32Type();
-  DType f32 = Float32Type();
-
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "unsigned_casts", .grid = {1}}, InSpec{{32, 128}, f32},
-      InSpec{{32, 128}, u8}, InSpec{{32, 128}, i8}, OutSpec{{32, 128}, f32},
+      GridSpec{.name = "unsigned_casts", .grid = {1}}, InSpec{f32(32, 128)},
+      InSpec{u8(32, 128)}, InSpec{i8(32, 128)}, OutSpec{f32(32, 128)},
       [&](Ref in_f, Ref in_u8, Ref in_i8, Ref out) {
         Tile f(in_f);
         Tile u(in_u8);
@@ -1044,12 +1124,10 @@ TEST_F(KilnTest, UnsignedAndSignedCasts) {
 }
 
 TEST_F(KilnTest, DynamicMemrefSliceSizesAndAll) {
-  DType f32 = Float32Type();
-
   absl::StatusOr<Kernel> kernel = CreateKernel(
       GridSpec{.name = "dynamic_slices"},
-      InSpec::Vmem({kDynamic, kDynamic, 128}, f32),
-      OutSpec::Vmem({8, 128}, f32), [&](Ref dyn_in, Ref /*vmem_out*/) {
+      InSpec::Vmem(f32(kDynamic, kDynamic, 128)), OutSpec::Vmem(f32(8, 128)),
+      [&](Ref dyn_in, Ref /*vmem_out*/) {
         EXPECT_EQ(dyn_in.memory_space(), MemorySpace::kVmem);
         EXPECT_FALSE(dyn_in.HasStaticShape());
         EXPECT_TRUE(dyn_in.IsDynamicDim(0));
@@ -1106,22 +1184,21 @@ TEST_F(KilnTest, DynamicMemrefSliceSizesAndAll) {
 }
 
 TEST_F(KilnTest, SteppedForScopedAllocaAndUnsignedBounds) {
-  DType f32 = Float32Type();
-  DType i32 = Int32Type();
-
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "stepped_for_alloca"},
-      InSpec::Vmem({kDynamic, 128}, f32), OutSpec::Vmem({8, 128}, f32),
-      [&](Ref dyn_in, Ref vmem_out) {
-        Ref local_smem = AllocaSmem({1}, i32);
+      GridSpec{.name = "stepped_for_alloca"}, InSpec::Vmem(f32(kDynamic, 128)),
+      OutSpec::Vmem(f32(8, 128)), [&](Ref dyn_in, Ref vmem_out) {
+        Ref local_smem = AllocaSmem(i32(1));
+        Ref scalar_smem = AllocaSmem(i32());
         EXPECT_EQ(local_smem.memory_space(), MemorySpace::kSmem);
         EXPECT_TRUE(local_smem.HasStaticShape());
+        EXPECT_EQ(scalar_smem.rank(), 0);
+        EXPECT_EQ(scalar_smem.shape(), i32());
 
         Scalar rows = dyn_in.Dim(0);
         For(0, rows, 8, [&](Scalar r) {
           Scalar aligned_r = MultipleOf(r, 8);
           RunScoped([&] {
-            Ref scratch_tile = AllocaVmem({8, 128}, f32);
+            Ref scratch_tile = AllocaVmem(f32(8, 128));
             EXPECT_EQ(scratch_tile.memory_space(), MemorySpace::kVmem);
             Ref tile_in = dyn_in(Slice(aligned_r, 8), all);
             EXPECT_TRUE(tile_in.HasStaticShape());
@@ -1163,12 +1240,9 @@ TEST_F(KilnTest, SteppedForScopedAllocaAndUnsignedBounds) {
 }
 
 TEST_F(KilnTest, DynamicShapeSliceAndAllocaValidationErrors) {
-  DType f32 = Float32Type();
-  DType i32 = Int32Type();
-
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "validation_errors"}, InSpec::Vmem({kDynamic, 128}, f32),
-      OutSpec::Vmem({8, 128}, f32), [&](Ref dyn_in, Ref vmem_out) {
+      GridSpec{.name = "validation_errors"}, InSpec::Vmem(f32(kDynamic, 128)),
+      OutSpec::Vmem(f32(8, 128)), [&](Ref dyn_in, Ref vmem_out) {
         Scalar rows = dyn_in.Dim(0);
         EXPECT_DEATH(static_cast<void>(Tile(dyn_in)),
                      "Tile load requires a Ref with a static shape");
@@ -1203,17 +1277,17 @@ TEST_F(KilnTest, DynamicShapeSliceAndAllocaValidationErrors) {
                      "Loop step must be positive");
         EXPECT_DEATH(For(0, 16, I32(0), [&](Scalar) {}),
                      "Loop step must be positive");
-        EXPECT_DEATH(static_cast<void>(AllocaSmem({0}, i32)),
+        EXPECT_DEATH(static_cast<void>(AllocaSmem(i32(0))),
                      "Alloca\\(\\) requires static positive dimensions");
-        EXPECT_DEATH(static_cast<void>(AllocaSmem({}, BFloat16Type())),
+        EXPECT_DEATH(static_cast<void>(AllocaSmem(bf16())),
                      "SMEM Alloca\\(\\) requires a 32-bit element type");
-        EXPECT_DEATH(static_cast<void>(AllocaSmem({1}, Int16Type())),
+        EXPECT_DEATH(static_cast<void>(AllocaSmem(i16(1))),
                      "SMEM Alloca\\(\\) requires a 32-bit element type");
-        EXPECT_DEATH(static_cast<void>(AllocaVmem({}, f32)),
+        EXPECT_DEATH(static_cast<void>(AllocaVmem(f32())),
                      "VMEM Alloca\\(\\) requires at least a 1D shape");
-        EXPECT_DEATH(static_cast<void>(AllocaVmem({8, 128}, BoolType())),
+        EXPECT_DEATH(static_cast<void>(AllocaVmem(bool_(8, 128))),
                      "VMEM Alloca\\(\\) does not support bool");
-        EXPECT_DEATH(static_cast<void>(AllocaVmem({8, 128}, Int64Type())),
+        EXPECT_DEATH(static_cast<void>(AllocaVmem(i64(8, 128))),
                      "VMEM Alloca\\(\\) does not support bool \\(i1\\) or "
                      "64-bit element types");
       });
@@ -1226,11 +1300,9 @@ TEST_F(KilnTest, DynamicShapeSliceAndAllocaValidationErrors) {
 }
 
 TEST_F(KilnTest, SemaphoreAndBarrierOperations) {
-  DType f32 = Float32Type();
-
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "semaphores", .grid = {1}}, InSpec::Hbm({8, 128}, f32),
-      OutSpec::Vmem({8, 128}, f32), [&](Ref, Ref) {
+      GridSpec{.name = "semaphores", .grid = {1}}, InSpec::Hbm(f32(8, 128)),
+      OutSpec::Vmem(f32(8, 128)), [&](Ref, Ref) {
         Scalar dst_dev = (ProgramId(0) + 1) % 2;
 
         Semaphore dma_sem0 = AllocaDmaSemaphore();
@@ -1282,25 +1354,19 @@ TEST_F(KilnTest, SemaphoreAndBarrierOperations) {
 }
 
 TEST_F(KilnTest, HbmAndSemaphoreValidationErrors) {
-  DType f32 = Float32Type();
-
   // HBM input/output specs with index_map are rejected by BuildKernel.
-  absl::StatusOr<Kernel> bad_hbm_in_map =
-      CreateKernel(GridSpec{.name = "bad_hbm_in", .grid = {1}},
-                   InSpec{{8, 128},
-                          f32,
-                          IndexMap([] { return IndexIndices{0, 0}; }),
-                          MemorySpace::kHbm},
-                   OutSpec::Vmem({8, 128}, f32), [&](Ref, Ref) {});
+  absl::StatusOr<Kernel> bad_hbm_in_map = CreateKernel(
+      GridSpec{.name = "bad_hbm_in", .grid = {1}},
+      InSpec{f32(8, 128), IndexMap([] { return IndexIndices{0, 0}; }),
+             MemorySpace::kHbm},
+      OutSpec::Vmem(f32(8, 128)), [&](Ref, Ref) {});
   EXPECT_FALSE(bad_hbm_in_map.ok());
   EXPECT_THAT(bad_hbm_in_map.status().message(),
               testing::HasSubstr("HBM operands do not support index_map"));
 
   absl::StatusOr<Kernel> bad_hbm_out_map = CreateKernel(
-      GridSpec{.name = "bad_hbm_out", .grid = {1}}, InSpec::Vmem({8, 128}, f32),
-      OutSpec{{8, 128},
-              f32,
-              IndexMap([] { return IndexIndices{0, 0}; }),
+      GridSpec{.name = "bad_hbm_out", .grid = {1}}, InSpec::Vmem(f32(8, 128)),
+      OutSpec{f32(8, 128), IndexMap([] { return IndexIndices{0, 0}; }),
               MemorySpace::kHbm},
       [&](Ref, Ref) {});
   EXPECT_FALSE(bad_hbm_out_map.ok());
@@ -1309,15 +1375,15 @@ TEST_F(KilnTest, HbmAndSemaphoreValidationErrors) {
 
   absl::StatusOr<Kernel> bad_hbm_scratch = CreateKernel(
       GridSpec{.name = "bad_hbm_scratch", .grid = {1}},
-      InSpec::Vmem({8, 128}, f32), OutSpec::Vmem({8, 128}, f32),
-      ScratchSpec{{8, 128}, f32, MemorySpace::kHbm}, [&](Ref, Ref, Ref) {});
+      InSpec::Vmem(f32(8, 128)), OutSpec::Vmem(f32(8, 128)),
+      ScratchSpec{f32(8, 128), MemorySpace::kHbm}, [&](Ref, Ref, Ref) {});
   EXPECT_FALSE(bad_hbm_scratch.ok());
   EXPECT_THAT(bad_hbm_scratch.status().message(),
               testing::HasSubstr("Scratch operands cannot use HBM"));
 
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "hbm_sem_errors"}, InSpec::Hbm({kDynamic, 128}, f32),
-      OutSpec::Vmem({8, 128}, f32), [&](Ref hbm_in, Ref vmem_out) {
+      GridSpec{.name = "hbm_sem_errors"}, InSpec::Hbm(f32(kDynamic, 128)),
+      OutSpec::Vmem(f32(8, 128)), [&](Ref hbm_in, Ref vmem_out) {
         SemaphoreArray dma_sems = AllocaDmaSemaphore({2});
         SemaphoreArray reg_sems = AllocaSemaphore({2, 3});
         Semaphore reg_sem = AllocaSemaphore();
@@ -1325,15 +1391,15 @@ TEST_F(KilnTest, HbmAndSemaphoreValidationErrors) {
         EXPECT_FALSE(reg_sems.is_dma());
         Ref hbm_tile = hbm_in(Slice(0, 8), all);
         EXPECT_DEATH(static_cast<void>(
-                         Alloca(ScratchSpec{{8, 128}, f32, MemorySpace::kHbm})),
+                         Alloca(ScratchSpec{f32(8, 128), MemorySpace::kHbm})),
                      "Cannot allocate HBM in a kernel");
         EXPECT_DEATH(
-            static_cast<void>(Alloca(ScratchSpec{{0}, f32, MemorySpace::kHbm})),
+            static_cast<void>(Alloca(ScratchSpec{f32(0), MemorySpace::kHbm})),
             "Cannot allocate HBM in a kernel");
-        EXPECT_DEATH(static_cast<void>(AllocaDmaSemaphore(Shape{})),
+        EXPECT_DEATH(static_cast<void>(AllocaDmaSemaphore(Dimensions{})),
                      "AllocaDmaSemaphore\\(shape\\) requires a non-empty "
                      "shape");
-        EXPECT_DEATH(static_cast<void>(AllocaSemaphore(Shape{})),
+        EXPECT_DEATH(static_cast<void>(AllocaSemaphore(Dimensions{})),
                      "AllocaSemaphore\\(shape\\) requires a non-empty shape");
         EXPECT_DEATH(static_cast<void>(AllocaDmaSemaphore({0})),
                      "AllocaDmaSemaphore\\(shape\\) requires static positive "
@@ -1363,7 +1429,7 @@ TEST_F(KilnTest, HbmAndSemaphoreValidationErrors) {
                      "Semaphore::Wait\\(\\) amount must be positive");
         EXPECT_DEATH(reg_sem.Signal(1, {.device_id = -1}),
                      "SemaphoreSignalOptions::device_id must be non-negative");
-        EXPECT_DEATH(reg_sem.Signal(I32(1).AsType(Int64Type())),
+        EXPECT_DEATH(reg_sem.Signal(I32(1).AsType(i64)),
                      "Semaphore::Signal\\(\\) amount scalar bitwidth must be "
                      "<= 32");
       });
@@ -1371,11 +1437,9 @@ TEST_F(KilnTest, HbmAndSemaphoreValidationErrors) {
 }
 
 TEST_F(KilnTest, DmaOperations) {
-  DType f32 = Float32Type();
-
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "dma_ops"}, InSpec::Hbm({8, 128}, f32),
-      OutSpec::Vmem({8, 128}, f32), [&](Ref hbm_in, Ref vmem_out) {
+      GridSpec{.name = "dma_ops"}, InSpec::Hbm(f32(8, 128)),
+      OutSpec::Vmem(f32(8, 128)), [&](Ref hbm_in, Ref vmem_out) {
         Scalar dev_id = DeviceId();
         Semaphore sem = AllocaDmaSemaphore();
         Semaphore send_sem = AllocaDmaSemaphore();
@@ -1468,13 +1532,11 @@ TEST_F(KilnTest, DmaOperations) {
 }
 
 TEST_F(KilnTest, UnboundedDynamicDma) {
-  DType f32 = Float32Type();
-
   // Unbounded-dynamic HBM <-> VMEM tiled copy loop.
   absl::StatusOr<Kernel> dyn_kernel = CreateKernel(
       GridSpec{.name = "unbounded_dynamic_dma"},
-      InSpec::Hbm({kDynamic, 128}, f32), OutSpec::Hbm({kDynamic, 128}, f32),
-      ScratchSpec::Vmem({8, 128}, f32),
+      InSpec::Hbm(f32(kDynamic, 128)), OutSpec::Hbm(f32(kDynamic, 128)),
+      ScratchSpec::Vmem(f32(8, 128)),
       [&](Ref hbm_in, Ref hbm_out, Ref vmem_buf) {
         Semaphore in_sem = AllocaDmaSemaphore();
         Semaphore out_sem = AllocaDmaSemaphore();
@@ -1513,21 +1575,18 @@ TEST_F(KilnTest, UnboundedDynamicDma) {
 }
 
 TEST_F(KilnTest, DmaValidationErrors) {
-  DType f32 = Float32Type();
-  DType i32 = Int32Type();
-
   absl::StatusOr<Kernel> kernel = CreateKernel(
-      GridSpec{.name = "dma_errors"}, InSpec::Hbm({kDynamic, 128}, f32),
-      OutSpec::Vmem({8, 128}, f32), [&](Ref hbm_in, Ref vmem_out) {
+      GridSpec{.name = "dma_errors"}, InSpec::Hbm(f32(kDynamic, 128)),
+      OutSpec::Vmem(f32(8, 128)), [&](Ref hbm_in, Ref vmem_out) {
         SemaphoreArray dma_sems = AllocaDmaSemaphore({2});
         Semaphore reg_sem = AllocaSemaphore();
         Ref hbm_tile = hbm_in(Slice(0, 8), all);
-        Ref vmem_i32 = AllocaVmem({8, 128}, i32);
-        Ref smem_f32 = AllocaSmem({8, 128}, f32);
+        Ref vmem_i32 = AllocaVmem(i32(8, 128));
+        Ref smem_f32 = AllocaSmem(f32(8, 128));
 
         EXPECT_DEATH(AsyncCopy(hbm_tile, vmem_i32, dma_sems(0)),
-                     "DMA source and destination Refs must have the same "
-                     "dtype");
+                     "DMA source and destination Refs must have matching "
+                     "shapes");
         EXPECT_DEATH(AsyncCopy(hbm_in, vmem_out, dma_sems(0)),
                      "DMA source and destination Refs must have matching "
                      "shapes");
@@ -1591,10 +1650,9 @@ TEST_F(KilnTest, DmaValidationErrors) {
 }
 
 TEST_F(KilnTest, CanonicalizeFoldsMemRefSliceAndEliminatesDeadOps) {
-  DType i32 = Int32Type();
   absl::StatusOr<Kernel> kernel =
       CreateKernel(GridSpec{.name = "canonicalize_smem", .grid = {4}},
-                   ScalarPrefetchSpec{{4}, i32}, OutSpec::Smem({4, 8}, i32),
+                   ScalarPrefetchSpec{i32(4)}, OutSpec::Smem(i32(4, 8)),
                    [&](Ref idx, Ref out) {
                      Scalar i = ProgramId(0);
                      Scalar v = Scalar(idx(i));
@@ -1616,6 +1674,39 @@ TEST_F(KilnTest, CanonicalizeFoldsMemRefSliceAndEliminatesDeadOps) {
     CHECK:         memref.store %[[V]], %[[OUT]][%[[I_IDX]], %[[C0]]] : memref<4x8xi32, #tpu.memory_space<smem>>
     CHECK:         return
   )");
+}
+
+TEST_F(KilnTest, ConstructsShapesFromDTypeCallOperator) {
+  Shape scalar_i32 = i32();
+  EXPECT_EQ(scalar_i32.rank(), 0);
+  EXPECT_THAT(scalar_i32.dims(), IsEmpty());
+  EXPECT_EQ(scalar_i32.dtype(), i32);
+  EXPECT_EQ(scalar_i32, i32(/*dims=*/{}));
+  EXPECT_EQ(scalar_i32, (Shape{/*dims=*/{}, i32}));
+
+  Shape vec_i32 = i32(128);
+  EXPECT_EQ(vec_i32.rank(), 1);
+  EXPECT_THAT(vec_i32.dims(), ElementsAre(128));
+  EXPECT_EQ(vec_i32, i32({128}));
+
+  Shape mat_f32 = f32(8, 128);
+  EXPECT_EQ(mat_f32.rank(), 2);
+  EXPECT_THAT(mat_f32.dims(), ElementsAre(8, 128));
+  EXPECT_EQ(mat_f32.dtype(), f32);
+  EXPECT_EQ(mat_f32, f32({8, 128}));
+  EXPECT_EQ(mat_f32, (Shape{{8, 128}, f32}));
+  EXPECT_NE(mat_f32, bf16(8, 128));
+  EXPECT_NE(mat_f32, f32(16, 128));
+
+  EXPECT_EQ(scalar_i32.ToString(), "i32[]");
+  EXPECT_EQ(vec_i32.ToString(), "i32[128]");
+  EXPECT_EQ(mat_f32.ToString(), "f32[8, 128]");
+  EXPECT_EQ(f32(kDynamic, 128).ToString(), "f32[?, 128]");
+  EXPECT_EQ(absl::StrCat(mat_f32), "f32[8, 128]");
+
+  std::ostringstream ss;
+  ss << mat_f32;
+  EXPECT_EQ(ss.str(), "f32[8, 128]");
 }
 
 }  // namespace
