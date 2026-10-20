@@ -13308,8 +13308,16 @@ Device-side assertion tracking was not enabled by user.""",
     t = torch.ones(2, 2, device=et.device(), dtype=dtype)
     with et.assert_raises_message(
         RuntimeError,
-        tpu=f"""logcumsumexp(): expected the input dtype to be floating point, got {tpu_dtype}""",
-        gpu=f""""logcumsumexp_cuda" not implemented for '{gpu_dtype}'""",
+        tpu=re.compile(
+            r"(logcumsumexp\(\): expected the input dtype to be floating"
+            rf" point, got {tpu_dtype}|logcumsumexp\(\): input dtype should be"
+            rf" either floating point or complex\. Got {gpu_dtype} instead\.)"
+        ),
+        gpu=re.compile(
+            r'("logcumsumexp_cuda" not implemented for'
+            rf" \x27{gpu_dtype}\x27|logcumsumexp\(\): input dtype should be"
+            rf" either floating point or complex\. Got {gpu_dtype} instead\.)"
+        ),
         message_reviewed_by="chizz",
     ):
       torch.logcumsumexp(t, dim=1)
