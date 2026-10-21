@@ -100,7 +100,7 @@ def test_jagged_align_and_strip_round_trip(case):
   assert unpadded is nested
 
 
-@pytest.mark.xfail(strict=True, reason="gpu004/torch_tpu#3")
+@pytest.mark.xfail(strict=True, reason="google-pytorch/torch_tpu#5673")
 def test_align_jagged_to_multiple_preserves_explicit_lengths():
   nested = torch.nested.nested_tensor_from_jagged(
     torch.arange(10.0).reshape(10, 1),

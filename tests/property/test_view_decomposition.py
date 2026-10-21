@@ -244,14 +244,16 @@ def test_view_decomposition_round_trips(case):
   assert tuple(base_tensor.shape) == tuple(base_shape)
 
 
-@pytest.mark.xfail(strict=True, raises=IndexError, reason="gpu004/torch_tpu#1")
+@pytest.mark.xfail(
+  strict=True, raises=IndexError, reason="google-pytorch/torch_tpu#5671"
+)
 def test_scalar_view_with_nonzero_storage_offset_decomposes():
   tensor = torch.tensor([0, 1]).select(0, 1)
   vd.decompose_into_view_sequence(tensor)
 
 
 @pytest.mark.xfail(
-  strict=True, raises=RuntimeError, reason="gpu004/torch_tpu#2"
+  strict=True, raises=RuntimeError, reason="google-pytorch/torch_tpu#5672"
 )
 def test_unit_dimension_view_base_fits_storage():
   tensor = torch.arange(9.0)[::2, None]
@@ -296,31 +298,41 @@ def _has_symbolic_layout(tensor):
     pytest.param(
       "x[1:]",
       lambda x: x[1:],
-      marks=pytest.mark.xfail(strict=True, reason="gpu004/torch_tpu#4"),
+      marks=pytest.mark.xfail(
+        strict=True, reason="google-pytorch/torch_tpu#5674"
+      ),
       id="row-slice",
     ),
     pytest.param(
       "x[1:, None]",
       lambda x: x[1:, None],
-      marks=pytest.mark.xfail(strict=True, reason="gpu004/torch_tpu#4"),
+      marks=pytest.mark.xfail(
+        strict=True, reason="google-pytorch/torch_tpu#5674"
+      ),
       id="row-slice-unsqueeze",
     ),
     pytest.param(
       "x.unsqueeze(1)[2:]",
       lambda x: x.unsqueeze(1)[2:],
-      marks=pytest.mark.xfail(strict=True, reason="gpu004/torch_tpu#4"),
+      marks=pytest.mark.xfail(
+        strict=True, reason="google-pytorch/torch_tpu#5674"
+      ),
       id="unsqueeze-row-slice",
     ),
     pytest.param(
       "x[None, 2:]",
       lambda x: x[None, 2:],
-      marks=pytest.mark.xfail(strict=True, reason="gpu004/torch_tpu#4"),
+      marks=pytest.mark.xfail(
+        strict=True, reason="google-pytorch/torch_tpu#5674"
+      ),
       id="leading-unsqueeze-slice",
     ),
     pytest.param(
       "x[2:, :1]",
       lambda x: x[2:, :1],
-      marks=pytest.mark.xfail(strict=True, reason="gpu004/torch_tpu#4"),
+      marks=pytest.mark.xfail(
+        strict=True, reason="google-pytorch/torch_tpu#5674"
+      ),
       id="row-and-unit-column-slice",
     ),
   ],
